@@ -35,6 +35,10 @@
     color:var(--muted); background:rgba(12,18,25,.72); border:1px solid rgba(255,255,255,.10);
     padding:6px 10px; border-radius:999px; -webkit-backdrop-filter:blur(18px); backdrop-filter:blur(18px); }
   #badge b { color:var(--accent); }
+  #levels { display:flex; gap:3px; align-items:flex-end; height:22px; width:52px; }
+  #levels i { flex:1; background:linear-gradient(#39d0ff, #ff59bf); border-radius:2px;
+    height:2px; transform-origin:bottom; transition:height .06s linear; }
+  #mic[data-on="1"] { border-color:rgba(57,208,255,.55); background:rgba(57,208,255,.16); }
   .maplibregl-ctrl-attrib { font-size:10px; }
 </style>
 </head>
@@ -48,6 +52,8 @@
       <div class="title">Transit flow</div>
       <div class="sub" id="status">starting…</div>
     </div>
+    <div id="levels" aria-hidden="true"><i></i><i></i><i></i></div>
+    <button id="mic" type="button" data-on="0">Mic</button>
     <button id="toggle" type="button">Pause</button>
   </div>
 </div>
@@ -105,7 +111,10 @@ const dpr = () => Math.min(window.devicePixelRatio || 1, 2);
 let running = true, backend = null;
 
 const WGSL = /* wgsl */`
-struct Globals { res: vec2f, time: f32, dpr: f32 };
+struct Globals {
+  res: vec2f, time: f32, dpr: f32,
+  bass: f32, mid: f32, treble: f32, beat: f32
+};
 @group(0) @binding(0) var<uniform> G: Globals;
 @group(0) @binding(1) var<storage, read> hubs: array<vec2f>;
 @group(0) @binding(2) var<storage, read> parts: array<vec4f>;
@@ -128,24 +137,31 @@ fn vs(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VSOut
   let a = hubs[u32(p.x)];
   let b = hubs[u32(p.y)];
 
-  // travel 0..1 along the route, looping
+  // travel 0..1 along the route, looping. G.time already carries the
+  // audio-accelerated clock, so tempo follows the music without jumping.
   let t = fract(p.z + G.time * p.w);
-  // gentle arc so routes don't collapse onto straight lines
+  // gentle arc so routes don't collapse onto straight lines; mids widen it
   let d = b - a;
-  let n = normalize(vec2f(-d.y, d.x)) * length(d) * 0.14;
+  let n = normalize(vec2f(-d.y, d.x)) * length(d) * (0.14 + G.mid * 0.22);
   let bend = sin(t * 3.14159265);
   let center = mix(a, b, t) + n * bend;
 
-  let size = (1.6 + 2.2 * bend) * G.dpr;
+  // bass swells every particle, the beat pulse kicks a subset of them
+  let kick = G.beat * step(0.55, fract(p.z * 31.7));
+  let size = (1.6 + 2.2 * bend) * (1.0 + G.bass * 1.6 + kick * 1.2) * G.dpr;
   let corner = QUAD[vi];
   let px = center * G.dpr + corner * size;
 
   var o: VSOut;
   o.pos = vec4f(px / G.res * vec2f(2., -2.) + vec2f(-1., 1.), 0., 1.);
   o.uv = corner;
-  o.tint = mix(vec3f(0.22, 0.82, 1.0), vec3f(1.0, 0.35, 0.75), fract(p.z * 7.13));
-  // fade in/out at the endpoints, and cull anything far off-screen
-  o.fade = smoothstep(0., 0.12, t) * smoothstep(1., 0.88, t);
+  // treble pushes the palette from cyan toward magenta/white
+  let hue = clamp(fract(p.z * 7.13) + G.treble * 0.55, 0., 1.);
+  o.tint = mix(vec3f(0.22, 0.82, 1.0), vec3f(1.0, 0.35, 0.75), hue)
+         + vec3f(G.treble * 0.25);
+  // fade in/out at the endpoints
+  o.fade = smoothstep(0., 0.12, t) * smoothstep(1., 0.88, t)
+         * (0.55 + 0.75 * G.bass + kick * 0.8);
   return o;
 }
 
@@ -181,7 +197,7 @@ async function initWebGPU() {
     primitive: { topology: 'triangle-list' }
   });
 
-  const uni = device.createBuffer({ size: 16, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+  const uni = device.createBuffer({ size: 32, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
   const hubBuf = device.createBuffer({ size: hubPx.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   const partBuf = device.createBuffer({ size: particles.byteLength, usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST });
   device.queue.writeBuffer(partBuf, 0, particles);
@@ -195,13 +211,14 @@ async function initWebGPU() {
     ]
   });
 
-  const u = new Float32Array(4);
+  const u = new Float32Array(8);
   device.lost.then(info => { backend = null; modeEl.textContent = 'lost'; statusEl.textContent = 'GPU device lost: ' + info.reason; });
 
   return {
     name: 'webgpu',
     draw(t) {
       u[0] = canvas.width; u[1] = canvas.height; u[2] = t; u[3] = dpr();
+      u[4] = audio.bass; u[5] = audio.mid; u[6] = audio.treble; u[7] = audio.beat;
       device.queue.writeBuffer(uni, 0, u);
       device.queue.writeBuffer(hubBuf, 0, hubPx);
 
@@ -218,6 +235,75 @@ async function initWebGPU() {
       device.queue.submit([enc.finish()]);
     }
   };
+}
+
+/* ------------------------------------------------------ audio input ---- */
+// Live mic analysis. iOS Safari requires a user gesture AND https to start an
+// AudioContext / getUserMedia, so this is only ever wired to the Mic button.
+const IDLE = { bass: 0.30, mid: 0.20, treble: 0.15 };
+const audio = {
+  on: false, bass: IDLE.bass, mid: IDLE.mid, treble: IDLE.treble, beat: 0,
+  ctx: null, analyser: null, stream: null, bins: null,
+  env: 0,          // slow bass envelope, used as the beat threshold
+  flow: 0          // audio-accelerated clock driving particle travel
+};
+
+async function micOn() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC || !navigator.mediaDevices?.getUserMedia) throw new Error('no Web Audio / mic API');
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
+  });
+  const ctx = new AC();
+  await ctx.resume();                       // iOS starts contexts suspended
+  const src = ctx.createMediaStreamSource(stream);
+  const analyser = ctx.createAnalyser();
+  analyser.fftSize = 1024;                  // 512 bins, cheap enough for a phone
+  analyser.smoothingTimeConstant = 0.75;
+  src.connect(analyser);                    // never connect to destination: feedback
+  audio.ctx = ctx; audio.analyser = analyser; audio.stream = stream;
+  audio.bins = new Uint8Array(analyser.frequencyBinCount);
+  audio.on = true;
+}
+
+function micOff() {
+  audio.on = false;
+  audio.stream?.getTracks().forEach(t => t.stop());
+  audio.ctx?.close();
+  audio.ctx = audio.analyser = audio.stream = null;
+  audio.bass = IDLE.bass; audio.mid = IDLE.mid; audio.treble = IDLE.treble; audio.beat = 0;
+}
+
+const bars = [...document.querySelectorAll('#levels i')];
+function sampleAudio(dt) {
+  if (audio.on && audio.analyser) {
+    audio.analyser.getByteFrequencyData(audio.bins);
+    const n = audio.bins.length, sr = audio.ctx.sampleRate;
+    const hz = i => (i * sr) / (n * 2);
+    const band = (lo, hi) => {
+      let s = 0, c = 0;
+      for (let i = 1; i < n; i++) { const f = hz(i); if (f >= lo && f < hi) { s += audio.bins[i]; c++; } }
+      return c ? s / c / 255 : 0;
+    };
+    // perceptual-ish curve, then attack fast / release slow so it feels musical
+    const shape = v => Math.min(1, Math.pow(v, 1.6) * 2.2);
+    const ease = (cur, next) => cur + (next - cur) * (next > cur ? 0.55 : 0.10);
+    audio.bass   = ease(audio.bass,   shape(band(20, 180)));
+    audio.mid    = ease(audio.mid,    shape(band(180, 2000)));
+    audio.treble = ease(audio.treble, shape(band(2000, 12000)));
+
+    // beat = bass jumping above its own running average
+    audio.env += (audio.bass - audio.env) * 0.05;
+    if (audio.bass > audio.env * 1.35 + 0.08) audio.beat = 1;
+    audio.beat = Math.max(0, audio.beat - dt * 3.5);
+  }
+  if (bars.length) {
+    bars[0].style.height = (2 + audio.bass   * 20) + 'px';
+    bars[1].style.height = (2 + audio.mid    * 20) + 'px';
+    bars[2].style.height = (2 + audio.treble * 20) + 'px';
+  }
+  // particles speed up with the low end
+  audio.flow += dt * (0.6 + audio.bass * 2.4 + audio.beat * 0.8);
 }
 
 // Canvas2D fallback so the page still works on iOS versions without WebGPU.
@@ -239,10 +325,14 @@ function init2D() {
         const p = (particles[o + 2] + t * particles[o + 3]) % 1;
         const dx = bx - ax, dy = by - ay, len = Math.hypot(dx, dy) || 1;
         const bend = Math.sin(p * Math.PI);
-        const x = (ax + dx * p - dy / len * len * 0.14 * bend) * s;
-        const y = (ay + dy * p + dx / len * len * 0.14 * bend) * s;
-        c.fillStyle = `rgba(90,210,255,${0.5 * bend})`;
-        c.beginPath(); c.arc(x, y, (1.2 + 1.6 * bend) * s, 0, 6.2832); c.fill();
+        const arc = 0.14 + audio.mid * 0.22;
+        const x = (ax + dx * p - dy * arc * bend) * s;
+        const y = (ay + dy * p + dx * arc * bend) * s;
+        const kick = audio.beat * (((i * 7) % 10) > 5 ? 1 : 0);
+        const r = (1.2 + 1.6 * bend) * (1 + audio.bass * 1.6 + kick * 1.2) * s;
+        const g = Math.round(210 - audio.treble * 90), b = Math.round(255);
+        c.fillStyle = `rgba(${90 + audio.treble * 140 | 0},${g},${b},${bend * (0.35 + audio.bass * 0.6)})`;
+        c.beginPath(); c.arc(x, y, r, 0, 6.2832); c.fill();
       }
     }
   };
@@ -256,13 +346,15 @@ function resize() {
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; }
 }
 
-let frames = 0, fpsAt = performance.now(), rafId = 0;
+let frames = 0, fpsAt = performance.now(), rafId = 0, last = performance.now();
 function frame(now) {
   rafId = requestAnimationFrame(frame);
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
   if (!running || !backend || document.hidden) return;
   resize();
   projectHubs();
-  backend.draw(now / 1000);
+  sampleAudio(dt);
+  backend.draw(audio.flow);
   frames++;
   if (now - fpsAt > 500) {
     fpsEl.textContent = Math.round((frames * 1000) / (now - fpsAt));
@@ -270,10 +362,39 @@ function frame(now) {
   }
 }
 
+const micBtn = document.getElementById('mic');
+micBtn.addEventListener('click', async () => {
+  if (audio.on) {
+    micOff();
+    micBtn.dataset.on = '0'; micBtn.textContent = 'Mic';
+    statusEl.textContent = `${PARTICLES} particles · ${HUBS} hubs`;
+    return;
+  }
+  micBtn.disabled = true;
+  statusEl.textContent = 'requesting microphone…';
+  try {
+    await micOn();
+    micBtn.dataset.on = '1'; micBtn.textContent = 'Mute';
+    statusEl.textContent = 'reacting to live audio';
+  } catch (err) {
+    statusEl.textContent = 'mic unavailable — ' + (err.name === 'NotAllowedError'
+      ? 'permission denied (needs https)' : err.message);
+    console.warn('mic failed:', err);
+  } finally { micBtn.disabled = false; }
+});
+
+// iOS suspends the AudioContext when the page goes to the background.
+document.addEventListener('visibilitychange', () => {
+  if (!audio.ctx) return;
+  if (document.hidden) audio.ctx.suspend(); else audio.ctx.resume();
+});
+window.addEventListener('pagehide', () => { if (audio.on) micOff(); });
+
 document.getElementById('toggle').addEventListener('click', e => {
   running = !running;
   e.currentTarget.textContent = running ? 'Pause' : 'Resume';
-  statusEl.textContent = running ? `${PARTICLES} particles · ${HUBS} hubs` : 'paused';
+  statusEl.textContent = !running ? 'paused'
+    : audio.on ? 'reacting to live audio' : `${PARTICLES} particles · ${HUBS} hubs`;
 });
 
 // iOS Safari: don't burn battery in a backgrounded tab.
@@ -281,8 +402,6 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) fpsA
 window.addEventListener('pagehide', () => cancelAnimationFrame(rafId));
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(() => { map.resize(); resize(); }, 250));
-// block double-tap-to-zoom on the chrome, keep it on the map
-document.querySelector('.panel').addEventListener('touchend', e => e.preventDefault(), { passive: false });
 
 map.on('load', async () => {
   try {
