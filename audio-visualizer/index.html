@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="fr">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Audio Visualizer</title>
+  <script type="module" crossorigin src="/audio-visualizer/assets/index-DDsKNL8x.js"></script>
+  <link rel="stylesheet" crossorigin href="/audio-visualizer/assets/index-CBiNsqUF.css">
+</head>
+
+<body>
+  <main>
+    <canvas id="visualizer" aria-label="Visualiseur audio"></canvas>
+    <section class="hud" aria-live="polite">
+      <p class="eyebrow">WEBGPU AUDIO LAB</p>
+      <h1>Reactive field</h1>
+      <div class="meters">
+        <span>BASS <b id="bass">0.00</b></span>
+        <span>MID <b id="mid">0.00</b></span>
+        <span>HIGH <b id="high">0.00</b></span>
+      </div>
+      <p id="status">Initialisation du GPU…</p>
+      <div class="controls">
+        <button id="capture" type="button">Capturer l’audio système</button>
+        <button id="stop" type="button" hidden>Arrêter</button>
+      </div>
+    </section>
+  </main>
+</body>
+
+</html>
