@@ -40,7 +40,9 @@
   #levels { margin-right:auto; display:flex; gap:3px; align-items:flex-end; height:22px; width:52px; }
   #levels i { flex:1; background:linear-gradient(#39d0ff, #ff59bf); border-radius:2px;
     height:2px; transform-origin:bottom; transition:height .06s linear; }
-  #mic[data-on="1"], #geo[data-on="1"] { border-color:rgba(57,208,255,.55); background:rgba(57,208,255,.16); }
+  #mic[data-on="1"], #geo[data-on="1"], #play[data-on="1"] {
+    border-color:rgba(57,208,255,.55); background:rgba(57,208,255,.16); }
+  #play { padding:10px 13px; font-size:15px; line-height:1; }
   #geo { padding:10px 12px; font-size:16px; line-height:1; }
   .maplibregl-ctrl-attrib { font-size:10px; }
   /* the panel's ◎ button drives GeolocateControl, so hide its default UI */
@@ -58,6 +60,7 @@
       <div class="sub" id="status">starting…</div>
     </div>
     <div id="levels" aria-hidden="true"><i></i><i></i><i></i></div>
+    <button id="play" type="button" data-on="0" title="Play the soundtrack">▶</button>
     <button id="geo" type="button" data-on="0" title="Show my location">◎</button>
     <button id="mic" type="button" data-on="0">Mic</button>
     <button id="toggle" type="button">Pause</button>
@@ -69,6 +72,7 @@
 const CENTER = [-73.5673, 45.5019];   // Montréal
 const PARTICLES = 4000, MAX_HUBS = 1024;
 const ROUTE_URL = 'route.geojson';
+const TRACK_URL = 'track.mp3';
 
 const statusEl = document.getElementById('status');
 const modeEl   = document.getElementById('mode');
@@ -199,15 +203,37 @@ async function addRoute() {
       'circle-color': '#39d0ff', 'circle-stroke-color': '#ffffff', 'circle-stroke-width': 2
     }
   });
+  // the hostel is the anchor of the trip: same family, bigger and brighter
+  map.addLayer({
+    id: 'hostel-glow', type: 'circle', source: 'route',
+    filter: ['==', ['get', 'kind'], 'hostel'],
+    paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 11, 16, 16, 34],
+      'circle-color': '#ff59bf', 'circle-opacity': 0.22, 'circle-blur': 0.9
+    }
+  });
+  map.addLayer({
+    id: 'hostel', type: 'circle', source: 'route',
+    filter: ['==', ['get', 'kind'], 'hostel'],
+    paint: {
+      'circle-radius': ['interpolate', ['linear'], ['zoom'], 11, 9, 16, 18],
+      'circle-color': '#ff59bf', 'circle-stroke-color': '#ffffff', 'circle-stroke-width': 2.5
+    }
+  });
+
   map.addSource('route-labels', {
     type: 'geojson',
     data: { type: 'FeatureCollection', features: gj.features.filter(f => f.geometry.type === 'Point') }
   });
   map.addLayer({
     id: 'route-labels', type: 'symbol', source: 'route-labels',
-    filter: ['in', ['get', 'kind'], ['literal', ['hotspot', 'start']]],
+    filter: ['in', ['get', 'kind'], ['literal', ['hotspot', 'start', 'hostel']]],
     layout: {
-      'text-field': ['get', 'name'], 'text-size': 11, 'text-offset': [0, 1.3],
+      'text-field': ['get', 'name'],
+      'text-size': ['case', ['==', ['get', 'kind'], 'hostel'], 15, 11],
+      // the hostel marker is bigger, so its label needs to clear it
+      'text-offset': ['case', ['==', ['get', 'kind'], 'hostel'],
+                      ['literal', [0, 2.4]], ['literal', [0, 1.3]]],
       'text-anchor': 'top', 'text-optional': true,
       'text-font': ['Open Sans Regular']  // fontstack served by the CARTO style
     },
@@ -216,7 +242,7 @@ async function addRoute() {
 
   // tap a hotspot for its description
   const popup = new maplibregl.Popup({ closeButton: true, offset: 12, maxWidth: '260px' });
-  for (const id of ['route-dots', 'route-start']) {
+  for (const id of ['route-dots', 'route-start', 'hostel']) {
     map.on('click', id, e => {
       const f = e.features[0];
       popup.setLngLat(f.geometry.coordinates)
@@ -378,36 +404,80 @@ async function initWebGPU() {
 // AudioContext / getUserMedia, so this is only ever wired to the Mic button.
 const IDLE = { bass: 0.30, mid: 0.20, treble: 0.15 };
 const audio = {
-  on: false, bass: IDLE.bass, mid: IDLE.mid, treble: IDLE.treble, beat: 0,
+  on: false, source: null, bass: IDLE.bass, mid: IDLE.mid, treble: IDLE.treble, beat: 0,
   ctx: null, analyser: null, stream: null, bins: null,
-  env: 0,          // slow bass envelope, used as the beat threshold
+  el: null, node: null, micNode: null,      // <audio> element + its graph nodes
+  peak: [0.08, 0.08, 0.08],                 // per-band running peak for auto-gain
+  since: 0,        // seconds since the last onset (refractory gap)
+  raw: 0, prevRaw: 0, fluxAvg: 0,           // spectral-flux onset detector
+  shownAt: 0,                               // throttle for the bpm readout
+  bpmAt: [],       // recent onset times, for the tempo readout
   flow: 0          // audio-accelerated clock driving particle travel
 };
 
-async function micOn() {
+// One AudioContext + AnalyserNode shared by both sources. The track is routed
+// on to destination so you hear it; the mic never is (that would feed back).
+function audioGraph() {
   const AC = window.AudioContext || window.webkitAudioContext;
-  if (!AC || !navigator.mediaDevices?.getUserMedia) throw new Error('no Web Audio / mic API');
+  if (!AC) throw new Error('no Web Audio');
+  if (!audio.ctx) {
+    audio.ctx = new AC();
+    audio.analyser = audio.ctx.createAnalyser();
+    audio.analyser.fftSize = 1024;              // 512 bins, cheap enough for a phone
+    audio.analyser.smoothingTimeConstant = 0.75;
+    audio.bins = new Uint8Array(audio.analyser.frequencyBinCount);
+  }
+  return audio.ctx;
+}
+
+// The bundled soundtrack. iOS needs the play() call inside the tap, and the
+// MediaElementSource can only be created once per element.
+async function trackOn() {
+  const ctx = audioGraph();
+  if (!audio.el) {
+    audio.el = new Audio(TRACK_URL);
+    audio.el.loop = true;
+    audio.el.crossOrigin = 'anonymous';
+    audio.el.preload = 'auto';
+    audio.el.addEventListener('ended', () => { audio.el.currentTime = 0; audio.el.play(); });
+    audio.node = ctx.createMediaElementSource(audio.el);
+    audio.node.connect(audio.analyser);
+    audio.analyser.connect(ctx.destination);    // audible
+  }
+  await ctx.resume();                           // iOS starts contexts suspended
+  await audio.el.play();
+  audio.on = true; audio.source = 'track';
+}
+
+function trackOff() {
+  audio.el?.pause();
+  if (audio.source === 'track') { audio.on = false; audio.source = null; resetBands(); }
+}
+
+async function micOn() {
+  if (!navigator.mediaDevices?.getUserMedia) throw new Error('no mic API');
+  const ctx = audioGraph();
   const stream = await navigator.mediaDevices.getUserMedia({
     audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
   });
-  const ctx = new AC();
-  await ctx.resume();                       // iOS starts contexts suspended
-  const src = ctx.createMediaStreamSource(stream);
-  const analyser = ctx.createAnalyser();
-  analyser.fftSize = 1024;                  // 512 bins, cheap enough for a phone
-  analyser.smoothingTimeConstant = 0.75;
-  src.connect(analyser);                    // never connect to destination: feedback
-  audio.ctx = ctx; audio.analyser = analyser; audio.stream = stream;
-  audio.bins = new Uint8Array(analyser.frequencyBinCount);
-  audio.on = true;
+  await ctx.resume();
+  audio.micNode = ctx.createMediaStreamSource(stream);
+  audio.micNode.connect(audio.analyser);    // never connect to destination: feedback
+  audio.stream = stream;
+  audio.on = true; audio.source = 'mic';
 }
 
 function micOff() {
-  audio.on = false;
   audio.stream?.getTracks().forEach(t => t.stop());
-  audio.ctx?.close();
-  audio.ctx = audio.analyser = audio.stream = null;
+  audio.micNode?.disconnect();
+  audio.micNode = null; audio.stream = null;
+  if (audio.source === 'mic') { audio.on = false; audio.source = null; resetBands(); }
+}
+
+function resetBands() {
+  audio.prevRaw = 0; audio.fluxAvg = 0; audio.since = 0; audio.bpmAt = [];
   audio.bass = IDLE.bass; audio.mid = IDLE.mid; audio.treble = IDLE.treble; audio.beat = 0;
+  audio.peak = [0.08, 0.08, 0.08];
 }
 
 const bars = [...document.querySelectorAll('#levels i')];
@@ -421,17 +491,49 @@ function sampleAudio(dt) {
       for (let i = 1; i < n; i++) { const f = hz(i); if (f >= lo && f < hi) { s += audio.bins[i]; c++; } }
       return c ? s / c / 255 : 0;
     };
-    // perceptual-ish curve, then attack fast / release slow so it feels musical
-    const shape = v => Math.min(1, Math.pow(v, 1.6) * 2.2);
+    // A mastered track is far hotter than mic input, so normalise each band
+    // against its own slowly-decaying peak instead of a fixed curve — that
+    // keeps the dynamics visible for any source and any volume.
+    const norm = (raw, i) => {
+      audio.peak[i] = Math.max(raw, audio.peak[i] * 0.9995, 0.08);
+      return Math.min(1, Math.pow(raw / audio.peak[i], 1.5));
+    };
     const ease = (cur, next) => cur + (next - cur) * (next > cur ? 0.55 : 0.10);
-    audio.bass   = ease(audio.bass,   shape(band(20, 180)));
-    audio.mid    = ease(audio.mid,    shape(band(180, 2000)));
-    audio.treble = ease(audio.treble, shape(band(2000, 12000)));
+    audio.bass   = ease(audio.bass,   norm(band(20, 180), 0));
+    audio.mid    = ease(audio.mid,    norm(band(180, 2000), 1));
+    audio.treble = ease(audio.treble, norm(band(2000, 12000), 2));
 
-    // beat = bass jumping above its own running average
-    audio.env += (audio.bass - audio.env) * 0.05;
-    if (audio.bass > audio.env * 1.35 + 0.08) audio.beat = 1;
+    // Onset detection runs on the RAW low-end, not the normalised value —
+    // normalised bass saturates near 1 on a mastered track and would never
+    // clear its own threshold. Refractory gap caps it at ~330 bpm.
+    // Onset detection by spectral flux on the low band: the frame-to-frame
+    // *rise* in energy, compared against its own running average. Level-based
+    // thresholds don't work here — a mastered track keeps the low band pinned
+    // near its envelope, so nothing ever crosses. Tuned against this track:
+    // ~2.1 onsets/s, median gap 0.48 s (~125 bpm).
+    const rawBass = band(20, 180);
+    audio.raw = rawBass;
+    // per-second rise, so the detector behaves the same at 30 or 60 fps
+    const flux = Math.max(0, rawBass - audio.prevRaw) / Math.max(dt, 1 / 120);
+    audio.prevRaw = rawBass;
+    audio.fluxAvg += (flux - audio.fluxAvg) * (1 - Math.exp(-dt / 0.8));
+    audio.since += dt;
+    if (flux > audio.fluxAvg * 2.5 + 0.2 && audio.since > 0.25) {
+      audio.beat = 1; audio.since = 0;
+      audio.bpmAt.push(performance.now());
+      if (audio.bpmAt.length > 16) audio.bpmAt.shift();
+    }
     audio.beat = Math.max(0, audio.beat - dt * 3.5);
+  }
+  // show the detected tempo while a source is running
+  if (audio.on && audio.bpmAt.length > 6 && performance.now() - audio.shownAt > 1500) {
+    const g = audio.bpmAt.slice(1).map((t, i) => t - audio.bpmAt[i]).sort((a, b) => a - b);
+    const med = g[g.length >> 1];
+    if (med > 200 && med < 1500) {
+      statusEl.textContent = (audio.source === 'track' ? 'soundtrack' : 'live audio') +
+                             ' · ' + Math.round(60000 / med) + ' bpm';
+    }
+    audio.shownAt = performance.now();
   }
   if (bars.length) {
     bars[0].style.height = (2 + audio.bass   * 20) + 'px';
@@ -480,10 +582,12 @@ function init2D() {
 }
 
 /* ------------------------------------------------------ my location ---- */
-// GeolocateControl handles the blue dot, accuracy halo and heading cone for us;
-// it needs https (or localhost) on iOS, same as the mic.
+// GeolocateControl gives us the blue dot, accuracy halo and heading cone. Its
+// trigger() silently returns false if it isn't set up yet (or if the browser
+// reports no support), so everything below also has a raw-API fallback and
+// always says out loud what actually happened.
 const geolocate = new maplibregl.GeolocateControl({
-  positionOptions: { enableHighAccuracy: true, timeout: 8000 },
+  positionOptions: { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 },
   trackUserLocation: true,
   showUserLocation: true,
   showAccuracyCircle: true,
@@ -492,7 +596,7 @@ const geolocate = new maplibregl.GeolocateControl({
 map.addControl(geolocate, 'top-right');
 
 const geoBtn = document.getElementById('geo');
-let here = null;
+let here = null, watchId = null, ownMarker = null, controlOn = false;
 
 // metres between two lon/lat pairs (equirectangular is plenty at this scale)
 function metres(a, b) {
@@ -510,22 +614,83 @@ function distanceToRoute(pos) {
   return best;
 }
 
-geolocate.on('geolocate', e => {
-  here = [e.coords.longitude, e.coords.latitude];
+function reportPosition(coords) {
+  here = [coords.longitude, coords.latitude];
   geoBtn.dataset.on = '1';
-  if (!HUBS) return;
+  if (!HUBS) { statusEl.textContent = 'located · ' + Math.round(coords.accuracy) + ' m accuracy'; return; }
   const d = distanceToRoute(here);
   statusEl.textContent = d < 60
-    ? 'on the route · ' + Math.round(e.coords.accuracy) + ' m accuracy'
+    ? 'on the route · ' + Math.round(coords.accuracy) + ' m accuracy'
     : (d < 1000 ? Math.round(d) + ' m' : (d / 1000).toFixed(1) + ' km') + ' from the route';
-});
-geolocate.on('trackuserlocationend', () => { geoBtn.dataset.on = '0'; });
-geolocate.on('error', err => {
+}
+
+// Geolocation errors are vague by design; say which one it is and what fixes it.
+function reportGeoError(err) {
   geoBtn.dataset.on = '0';
-  statusEl.textContent = 'location unavailable — ' +
-    (err.code === 1 ? 'permission denied (needs https)' : err.message || 'try again outdoors');
+  const why = {
+    1: window.isSecureContext
+       ? 'permission denied — allow Location for this site (iOS: Settings ▸ Apps ▸ Safari ▸ Location)'
+       : 'permission denied — the page must be served over https',
+    2: 'position unavailable — no fix yet, try outdoors or turn Location Services on',
+    3: 'timed out waiting for a fix — try again'
+  }[err && err.code] || (err && err.message) || 'unknown error';
+  statusEl.textContent = 'location: ' + why;
+  console.warn('geolocate', err);
+}
+
+geolocate.on('geolocate', e => { controlOn = true; reportPosition(e.coords); });
+geolocate.on('trackuserlocationstart', () => { controlOn = true; });
+geolocate.on('trackuserlocationend', () => { controlOn = false; if (watchId === null) geoBtn.dataset.on = '0'; });
+geolocate.on('error', reportGeoError);
+
+// Fallback path: our own marker driven by watchPosition, used when the control
+// can't take the trigger.
+function watchOurselves() {
+  if (watchId !== null) return;
+  statusEl.textContent = 'locating…';
+  watchId = navigator.geolocation.watchPosition(pos => {
+    const ll = [pos.coords.longitude, pos.coords.latitude];
+    if (!ownMarker) {
+      const el = document.createElement('div');
+      el.style.cssText = 'width:18px;height:18px;border-radius:50%;background:#39d0ff;' +
+                         'border:2px solid #fff;box-shadow:0 0 12px rgba(57,208,255,.9)';
+      ownMarker = new maplibregl.Marker({ element: el }).setLngLat(ll).addTo(map);
+      map.easeTo({ center: ll, zoom: Math.max(map.getZoom(), 14), duration: 800 });
+    } else {
+      ownMarker.setLngLat(ll);
+    }
+    reportPosition(pos.coords);
+  }, err => {
+    navigator.geolocation.clearWatch(watchId); watchId = null;
+    reportGeoError(err);
+  }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 });
+}
+
+function stopWatching() {
+  if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  ownMarker?.remove(); ownMarker = null;
+  geoBtn.dataset.on = '0';
+}
+
+geoBtn.addEventListener('click', () => {
+  if (!('geolocation' in navigator)) { statusEl.textContent = 'location: unsupported browser'; return; }
+  if (!window.isSecureContext) {
+    statusEl.textContent = 'location: needs https — open the https:// address';
+    return;
+  }
+  if (watchId !== null || controlOn) {                 // second tap turns it off
+    stopWatching();
+    if (controlOn) { try { geolocate._clearWatch?.(); } catch (e) { console.warn(e); } controlOn = false; }
+    statusEl.textContent = 'location off';
+    return;
+  }
+  // trigger() returns false when the control isn't ready; fall back rather than
+  // leaving the tap doing nothing
+  let ok = false;
+  try { ok = geolocate.trigger(); } catch (e) { console.warn('trigger', e); }
+  if (ok === false) watchOurselves();
+  else statusEl.textContent = 'locating…';
 });
-geoBtn.addEventListener('click', () => geolocate.trigger());
 
 /* ------------------------------------------------------- main loop ----- */
 function resize() {
@@ -551,14 +716,39 @@ function frame(now) {
   }
 }
 
-const micBtn = document.getElementById('mic');
-micBtn.addEventListener('click', async () => {
-  if (audio.on) {
-    micOff();
-    micBtn.dataset.on = '0'; micBtn.textContent = 'Mic';
-    statusEl.textContent = `${PARTICLES} particles · ${HUBS} hubs`;
+const micBtn  = document.getElementById('mic');
+const playBtn = document.getElementById('play');
+
+// track and mic are mutually exclusive: one analyser, one source at a time
+playBtn.addEventListener('click', async () => {
+  if (audio.source === 'track') {
+    trackOff();
+    playBtn.dataset.on = '0'; playBtn.textContent = '▶';
+    statusEl.textContent = 'soundtrack paused';
     return;
   }
+  if (audio.source === 'mic') { micOff(); micBtn.dataset.on = '0'; micBtn.textContent = 'Mic'; }
+  playBtn.disabled = true;
+  statusEl.textContent = 'loading the soundtrack…';
+  try {
+    await trackOn();
+    playBtn.dataset.on = '1'; playBtn.textContent = '❚❚';
+    statusEl.textContent = 'reacting to the soundtrack';
+  } catch (err) {
+    statusEl.textContent = 'audio failed — ' + (err.name === 'NotAllowedError'
+      ? 'tap play again to allow sound' : err.message);
+    console.warn('track failed:', err);
+  } finally { playBtn.disabled = false; }
+});
+
+micBtn.addEventListener('click', async () => {
+  if (audio.source === 'mic') {
+    micOff();
+    micBtn.dataset.on = '0'; micBtn.textContent = 'Mic';
+    statusEl.textContent = `${PARTICLES} particles`;
+    return;
+  }
+  if (audio.source === 'track') { trackOff(); playBtn.dataset.on = '0'; playBtn.textContent = '▶'; }
   micBtn.disabled = true;
   statusEl.textContent = 'requesting microphone…';
   try {
@@ -567,7 +757,7 @@ micBtn.addEventListener('click', async () => {
     statusEl.textContent = 'reacting to live audio';
   } catch (err) {
     statusEl.textContent = 'mic unavailable — ' + (err.name === 'NotAllowedError'
-      ? 'permission denied (needs https)' : err.message);
+      ? 'permission denied' : err.message);
     console.warn('mic failed:', err);
   } finally { micBtn.disabled = false; }
 });
@@ -575,9 +765,10 @@ micBtn.addEventListener('click', async () => {
 // iOS suspends the AudioContext when the page goes to the background.
 document.addEventListener('visibilitychange', () => {
   if (!audio.ctx) return;
-  if (document.hidden) audio.ctx.suspend(); else audio.ctx.resume();
+  if (document.hidden) { audio.el?.pause(); audio.ctx.suspend(); }
+  else { audio.ctx.resume(); if (audio.source === 'track') audio.el?.play().catch(() => {}); }
 });
-window.addEventListener('pagehide', () => { if (audio.on) micOff(); });
+window.addEventListener('pagehide', () => { trackOff(); micOff(); });
 
 document.getElementById('toggle').addEventListener('click', e => {
   running = !running;
@@ -592,7 +783,9 @@ window.addEventListener('pagehide', () => cancelAnimationFrame(rafId));
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(() => { map.resize(); resize(); }, 250));
 
-map.on('load', async () => {
+// 'load' waits for basemap tiles too, so a slow or blocked tile server would
+// leave the overlay dead. 'style.load' is all we need to add sources/layers.
+map.once('style.load', async () => {
   try { await addRoute(); } catch (err) {
     console.warn('route failed:', err);
     statusEl.textContent = 'route failed to load — ' + err.message;
