@@ -480,10 +480,12 @@ function init2D() {
 }
 
 /* ------------------------------------------------------ my location ---- */
-// GeolocateControl handles the blue dot, accuracy halo and heading cone for us;
-// it needs https (or localhost) on iOS, same as the mic.
+// GeolocateControl gives us the blue dot, accuracy halo and heading cone. Its
+// trigger() silently returns false if it isn't set up yet (or if the browser
+// reports no support), so everything below also has a raw-API fallback and
+// always says out loud what actually happened.
 const geolocate = new maplibregl.GeolocateControl({
-  positionOptions: { enableHighAccuracy: true, timeout: 8000 },
+  positionOptions: { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 },
   trackUserLocation: true,
   showUserLocation: true,
   showAccuracyCircle: true,
@@ -492,7 +494,7 @@ const geolocate = new maplibregl.GeolocateControl({
 map.addControl(geolocate, 'top-right');
 
 const geoBtn = document.getElementById('geo');
-let here = null;
+let here = null, watchId = null, ownMarker = null, controlOn = false;
 
 // metres between two lon/lat pairs (equirectangular is plenty at this scale)
 function metres(a, b) {
@@ -510,22 +512,83 @@ function distanceToRoute(pos) {
   return best;
 }
 
-geolocate.on('geolocate', e => {
-  here = [e.coords.longitude, e.coords.latitude];
+function reportPosition(coords) {
+  here = [coords.longitude, coords.latitude];
   geoBtn.dataset.on = '1';
-  if (!HUBS) return;
+  if (!HUBS) { statusEl.textContent = 'located · ' + Math.round(coords.accuracy) + ' m accuracy'; return; }
   const d = distanceToRoute(here);
   statusEl.textContent = d < 60
-    ? 'on the route · ' + Math.round(e.coords.accuracy) + ' m accuracy'
+    ? 'on the route · ' + Math.round(coords.accuracy) + ' m accuracy'
     : (d < 1000 ? Math.round(d) + ' m' : (d / 1000).toFixed(1) + ' km') + ' from the route';
-});
-geolocate.on('trackuserlocationend', () => { geoBtn.dataset.on = '0'; });
-geolocate.on('error', err => {
+}
+
+// Geolocation errors are vague by design; say which one it is and what fixes it.
+function reportGeoError(err) {
   geoBtn.dataset.on = '0';
-  statusEl.textContent = 'location unavailable — ' +
-    (err.code === 1 ? 'permission denied (needs https)' : err.message || 'try again outdoors');
+  const why = {
+    1: window.isSecureContext
+       ? 'permission denied — allow Location for this site (iOS: Settings ▸ Apps ▸ Safari ▸ Location)'
+       : 'permission denied — the page must be served over https',
+    2: 'position unavailable — no fix yet, try outdoors or turn Location Services on',
+    3: 'timed out waiting for a fix — try again'
+  }[err && err.code] || (err && err.message) || 'unknown error';
+  statusEl.textContent = 'location: ' + why;
+  console.warn('geolocate', err);
+}
+
+geolocate.on('geolocate', e => { controlOn = true; reportPosition(e.coords); });
+geolocate.on('trackuserlocationstart', () => { controlOn = true; });
+geolocate.on('trackuserlocationend', () => { controlOn = false; if (watchId === null) geoBtn.dataset.on = '0'; });
+geolocate.on('error', reportGeoError);
+
+// Fallback path: our own marker driven by watchPosition, used when the control
+// can't take the trigger.
+function watchOurselves() {
+  if (watchId !== null) return;
+  statusEl.textContent = 'locating…';
+  watchId = navigator.geolocation.watchPosition(pos => {
+    const ll = [pos.coords.longitude, pos.coords.latitude];
+    if (!ownMarker) {
+      const el = document.createElement('div');
+      el.style.cssText = 'width:18px;height:18px;border-radius:50%;background:#39d0ff;' +
+                         'border:2px solid #fff;box-shadow:0 0 12px rgba(57,208,255,.9)';
+      ownMarker = new maplibregl.Marker({ element: el }).setLngLat(ll).addTo(map);
+      map.easeTo({ center: ll, zoom: Math.max(map.getZoom(), 14), duration: 800 });
+    } else {
+      ownMarker.setLngLat(ll);
+    }
+    reportPosition(pos.coords);
+  }, err => {
+    navigator.geolocation.clearWatch(watchId); watchId = null;
+    reportGeoError(err);
+  }, { enableHighAccuracy: true, timeout: 15000, maximumAge: 30000 });
+}
+
+function stopWatching() {
+  if (watchId !== null) { navigator.geolocation.clearWatch(watchId); watchId = null; }
+  ownMarker?.remove(); ownMarker = null;
+  geoBtn.dataset.on = '0';
+}
+
+geoBtn.addEventListener('click', () => {
+  if (!('geolocation' in navigator)) { statusEl.textContent = 'location: unsupported browser'; return; }
+  if (!window.isSecureContext) {
+    statusEl.textContent = 'location: needs https — open the https:// address';
+    return;
+  }
+  if (watchId !== null || controlOn) {                 // second tap turns it off
+    stopWatching();
+    if (controlOn) { try { geolocate._clearWatch?.(); } catch (e) { console.warn(e); } controlOn = false; }
+    statusEl.textContent = 'location off';
+    return;
+  }
+  // trigger() returns false when the control isn't ready; fall back rather than
+  // leaving the tap doing nothing
+  let ok = false;
+  try { ok = geolocate.trigger(); } catch (e) { console.warn('trigger', e); }
+  if (ok === false) watchOurselves();
+  else statusEl.textContent = 'locating…';
 });
-geoBtn.addEventListener('click', () => geolocate.trigger());
 
 /* ------------------------------------------------------- main loop ----- */
 function resize() {
@@ -592,7 +655,9 @@ window.addEventListener('pagehide', () => cancelAnimationFrame(rafId));
 window.addEventListener('resize', resize);
 window.addEventListener('orientationchange', () => setTimeout(() => { map.resize(); resize(); }, 250));
 
-map.on('load', async () => {
+// 'load' waits for basemap tiles too, so a slow or blocked tile server would
+// leave the overlay dead. 'style.load' is all we need to add sources/layers.
+map.once('style.load', async () => {
   try { await addRoute(); } catch (err) {
     console.warn('route failed:', err);
     statusEl.textContent = 'route failed to load — ' + err.message;
