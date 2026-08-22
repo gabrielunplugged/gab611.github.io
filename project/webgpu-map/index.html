@@ -444,8 +444,12 @@ async function trackOn() {
     audio.node.connect(audio.analyser);
     audio.analyser.connect(ctx.destination);    // audible
   }
-  await ctx.resume();                           // iOS starts contexts suspended
+  // Order matters: AudioContext.resume() never settles until the page has user
+  // activation, so awaiting it first would hang forever on a blocked autoplay.
+  // play() rejects promptly instead, which is the signal we can act on.
+  ctx.resume().catch(() => {});
   await audio.el.play();
+  await ctx.resume().catch(() => {});            // now guaranteed to go running
   audio.on = true; audio.source = 'track';
 }
 
@@ -770,6 +774,40 @@ document.addEventListener('visibilitychange', () => {
 });
 window.addEventListener('pagehide', () => { trackOff(); micOff(); });
 
+// Autoplay. Safari (and Chrome) refuse audible playback without a gesture, so:
+// try it outright, and if the promise rejects, arm a one-shot listener that
+// starts on the very first touch/click/key anywhere on the page. From the
+// visitor's side that means it plays by itself, or on their first tap.
+async function autoplay() {
+  try {
+    // belt and braces: if play() neither resolves nor rejects, treat it as blocked
+    await Promise.race([
+      trackOn(),
+      new Promise((_, rej) => setTimeout(() => rej(new Error('autoplay timed out')), 4000))
+    ]);
+    playBtn.dataset.on = '1'; playBtn.textContent = '❚❚';
+    statusEl.textContent = 'reacting to the soundtrack';
+    return true;
+  } catch (err) {
+    console.info('autoplay blocked, waiting for a gesture:', err.name || err);
+    statusEl.textContent = 'tap anywhere to start the soundtrack';
+    const start = async () => {
+      try {
+        await trackOn();
+        playBtn.dataset.on = '1'; playBtn.textContent = '❚❚';
+        statusEl.textContent = 'reacting to the soundtrack';
+      } catch (e) {
+        statusEl.textContent = 'audio blocked — tap ▶ to play';
+        console.warn('gesture start failed:', e);
+      }
+    };
+    for (const ev of ['pointerdown', 'touchend', 'keydown']) {
+      window.addEventListener(ev, start, { once: true, passive: true });
+    }
+    return false;
+  }
+}
+
 document.getElementById('toggle').addEventListener('click', e => {
   running = !running;
   e.currentTarget.textContent = running ? 'Pause' : 'Resume';
@@ -802,6 +840,7 @@ map.once('style.load', async () => {
   }
   resize();
   rafId = requestAnimationFrame(frame);
+  autoplay();
 });
 </script>
 </body>
